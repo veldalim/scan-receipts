@@ -22,12 +22,13 @@ async function startServer() {
   app.get('/api/health', (_req: Request, res: Response) => {
     res.json({
       status: 'ok',
-      hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+      hasMistralKey: Boolean(process.env.MISTRAL_API_KEY),
+      hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
       timestamp: new Date().toISOString(),
     });
   });
 
-  // Mount the root-level serverless Gemini receipt scanning handler
+  // Mount the root-level serverless Mistral receipt scanning handler
   app.all('/api/scan-receipt', (req: Request, res: Response) => {
     return scanReceiptHandler(req, res);
   });

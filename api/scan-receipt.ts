@@ -1,31 +1,40 @@
 import type { Request, Response } from 'express';
 
-// Primary endpoint requested by user
-const PRIMARY_MODEL = 'gemini-3.8-flash';
-// Resilient fallback model when Google infrastructure returns 503 high demand
-const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
+// Mistral API Endpoint
+const MISTRAL_API_ENDPOINT = 'https://api.mistral.ai/v1/chat/completions';
 
-interface GeminiResponse {
-  candidates?: Array<{
-    content?: {
-      parts?: Array<{
-        text?: string;
-      }>;
-    };
-  }>;
+// Primary model requested by the user
+const PRIMARY_MODEL = 'mistral-small-latest';
+// Fallback multimodal model in Mistral's suite
+const VISION_MODEL = 'pixtral-12b-2409';
+
+interface MistralChoice {
+  index?: number;
+  message?: {
+    role?: string;
+    content?: string | Array<{ type: string; text?: string }>;
+  };
+  finish_reason?: string;
+}
+
+interface MistralResponse {
+  id?: string;
+  choices?: MistralChoice[];
+  message?: string;
   error?: {
-    code: number;
-    message: string;
-    status: string;
+    message?: string;
+    type?: string;
+    code?: string | number;
   };
 }
 
 /**
- * Serverless handler to scan clinic receipts and extract:
+ * Serverless handler connecting to Mistral API
+ * to extract:
  * 1. Patient Name
  * 2. Clinic / Healthcare Provider
  * 3. After GST Amount
- * using direct serverless REST connection to Gemini API.
+ * from uploaded clinic receipts.
  */
 export default async function handler(req: Request, res: Response) {
   // Always guarantee JSON response header
@@ -34,7 +43,7 @@ export default async function handler(req: Request, res: Response) {
   if (req.method !== 'POST') {
     return res.status(405).json({
       success: false,
-      error: 'Method not allowed. Please use POST.',
+      error: 'Method not allowed. Use POST.',
     });
   }
 
@@ -48,21 +57,24 @@ export default async function handler(req: Request, res: Response) {
       });
     }
 
-    const apiKey = process.env.GEMINI_API_KEY;
+    // Do not hardcode any key. Read dynamically from environment variables.
+    const apiKey = process.env.MISTRAL_API_KEY;
     if (!apiKey) {
-      return res.status(500).json({
+      return res.status(200).json({
         success: false,
-        error: 'GEMINI_API_KEY environment variable is not configured on the server.',
+        error:
+          'MISTRAL_API_KEY is not configured in your environment. Please add MISTRAL_API_KEY to your environment variables.',
       });
     }
 
-    // Clean base64 string
+    // Prepare clean data URL
     const cleanBase64 = imageBase64.replace(/^data:[a-zA-Z0-9/+-]+;base64,/, '');
+    const dataUrl = `data:${mimeType};base64,${cleanBase64}`;
 
-    const prompt = `You are an expert medical receipt and tax invoice OCR specialist.
-Examine this clinic receipt image and extract all clinical and tax details with high precision:
+    const prompt = `You are a medical receipt and tax invoice OCR extraction expert.
+Analyze this clinical receipt image carefully. Extract the clinical and tax details with high precision:
 1. Patient Name: Name of the individual patient receiving treatment or billed.
-2. Clinic Name: Name of the medical clinic, dental clinic, hospital, or specialist center.
+2. Clinic Name: Name of the medical clinic, dental clinic, hospital, or specialist practice.
 3. After GST Amount: The final total payable amount INCLUDING Goods and Services Tax (GST / VAT).
 4. Before GST Amount: The subtotal before GST is applied.
 5. GST Rate: The GST tax percentage (e.g. 9 for 9%, 8 for 8%, 7 for 7%).
@@ -107,114 +119,103 @@ Return ONLY a valid JSON object matching this structure without Markdown backtic
   ]
 }`;
 
-    const requestBody = {
-      contents: [
-        {
-          parts: [
-            {
-              inline_data: {
-                mime_type: mimeType,
-                data: cleanBase64,
+    // Helper to call Mistral Chat Completions API
+    const callMistral = async (modelName: string) => {
+      const payload = {
+        model: modelName,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: prompt,
               },
-            },
-            {
-              text: prompt,
-            },
-          ],
+              {
+                type: 'image_url',
+                image_url: dataUrl,
+              },
+            ],
+          },
+        ],
+        response_format: {
+          type: 'json_object',
         },
-      ],
-      generationConfig: {
-        responseMimeType: 'application/json',
         temperature: 0.1,
-      },
-    };
+      };
 
-    // Helper to call Gemini REST API
-    const callGeminiModel = async (model: string) => {
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-      const resp = await fetch(endpoint, {
+      const response = await fetch(MISTRAL_API_ENDPOINT, {
         method: 'POST',
         headers: {
-          'x-goog-api-key': apiKey,
+          Authorization: `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
-          accept: 'application/json',
+          Accept: 'application/json',
         },
-        body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(15000),
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(20000),
       });
 
-      const responseText = await resp.text();
-      let parsedJson: GeminiResponse;
+      const rawText = await response.text();
+      let json: MistralResponse;
       try {
-        parsedJson = JSON.parse(responseText);
+        json = JSON.parse(rawText);
       } catch {
         return {
-          status: resp.status,
           ok: false,
-          data: {
-            error: {
-              code: resp.status,
-              message: responseText.slice(0, 200),
-              status: 'INVALID_RESPONSE',
-            },
-          },
+          status: response.status,
+          error: `Non-JSON response from Mistral API (${response.status}): ${rawText.slice(0, 150)}`,
+        };
+      }
+
+      if (!response.ok) {
+        const errorMsg = json.error?.message || json.message || `Mistral API returned status ${response.status}`;
+        return {
+          ok: false,
+          status: response.status,
+          error: errorMsg,
         };
       }
 
       return {
-        status: resp.status,
-        ok: resp.ok,
-        data: parsedJson,
+        ok: true,
+        status: response.status,
+        data: json,
       };
     };
 
-    // Attempt 1: Call PRIMARY_MODEL (gemini-3.8-flash)
-    let result: { status: number; ok: boolean; data: GeminiResponse };
-    try {
-      result = await callGeminiModel(PRIMARY_MODEL);
-    } catch (primaryErr) {
-      console.warn(`Primary model ${PRIMARY_MODEL} network or timeout error:`, primaryErr);
-      result = {
-        status: 503,
-        ok: false,
-        data: {
-          error: {
-            code: 503,
-            message: 'Primary model connection timeout or unavailable',
-            status: 'UNAVAILABLE',
-          },
-        },
-      };
+    // First attempt with user requested model (mistral-small-latest)
+    let result = await callMistral(PRIMARY_MODEL);
+
+    // If model does not support image or returns model error, try vision-capable Pixtral
+    if (!result.ok && result.error && (result.error.includes('image') || result.error.includes('vision') || result.error.includes('model') || result.status === 400 || result.status === 404)) {
+      console.warn(`Model ${PRIMARY_MODEL} returned: ${result.error}. Retrying with Mistral vision model ${VISION_MODEL}...`);
+      result = await callMistral(VISION_MODEL);
     }
 
-    // If 503 (high demand) or 429, fall back to FALLBACK_MODEL (gemini-3.1-flash-lite)
-    if (!result.ok && (result.status === 503 || result.status === 429 || result.status === 404)) {
-      console.warn(`Primary model returned ${result.status}. Executing fallback with ${FALLBACK_MODEL}...`);
-      try {
-        result = await callGeminiModel(FALLBACK_MODEL);
-      } catch (fallbackErr) {
-        console.error(`Fallback model ${FALLBACK_MODEL} error:`, fallbackErr);
-      }
-    }
-
-    if (!result.ok) {
-      const errorMsg = result.data.error?.message || `API error with status ${result.status}`;
+    if (!result.ok || !result.data) {
       return res.status(200).json({
         success: false,
-        error: errorMsg,
+        error: result.error || 'Failed to scan receipt with Mistral API.',
       });
     }
 
-    const rawContent = result.data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!rawContent) {
+    const content = result.data.choices?.[0]?.message?.content;
+    let contentStr = '';
+    if (typeof content === 'string') {
+      contentStr = content;
+    } else if (Array.isArray(content)) {
+      contentStr = content.map((c) => c.text || '').join('');
+    }
+
+    if (!contentStr) {
       return res.status(200).json({
         success: false,
-        error: 'No text content returned from Gemini model candidate.',
+        error: 'Empty response returned from Mistral model.',
       });
     }
 
-    // Clean JSON string of any markdown fences
-    const cleanedJsonStr = rawContent
+    // Clean JSON response (strip markdown wrappers if any)
+    const cleanedJsonStr = contentStr
       .replace(/^```json\s*/i, '')
       .replace(/^```\s*/i, '')
       .replace(/\s*```$/i, '')
@@ -227,7 +228,7 @@ Return ONLY a valid JSON object matching this structure without Markdown backtic
       data: parsedData,
     });
   } catch (err: unknown) {
-    console.error('Serverless scan-receipt error:', err);
+    console.error('Serverless Mistral scan-receipt error:', err);
     const message = err instanceof Error ? err.message : 'Unknown error during receipt scan';
     return res.status(200).json({
       success: false,
