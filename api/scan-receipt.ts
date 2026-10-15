@@ -1,20 +1,41 @@
 import type { Request, Response } from 'express';
 
-// Gemini REST API endpoint for gemini-3.8-flash serverless execution
-const GEMINI_API_ENDPOINT =
-  'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent';
+// Primary endpoint requested by user
+const PRIMARY_MODEL = 'gemini-3.8-flash';
+// Resilient fallback model when Google infrastructure returns 503 high demand
+const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
+
+interface GeminiResponse {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{
+        text?: string;
+      }>;
+    };
+  }>;
+  error?: {
+    code: number;
+    message: string;
+    status: string;
+  };
+}
 
 /**
  * Serverless handler to scan clinic receipts and extract:
  * 1. Patient Name
  * 2. Clinic / Healthcare Provider
  * 3. After GST Amount
- * using direct serverless connection to Gemini REST API.
+ * using direct serverless REST connection to Gemini API.
  */
 export default async function handler(req: Request, res: Response) {
-  // Support both POST requests and preflight checks
+  // Always guarantee JSON response header
+  res.setHeader('Content-Type', 'application/json');
+
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    return res.status(405).json({
+      success: false,
+      error: 'Method not allowed. Please use POST.',
+    });
   }
 
   try {
@@ -22,24 +43,24 @@ export default async function handler(req: Request, res: Response) {
 
     if (!imageBase64) {
       return res.status(400).json({
+        success: false,
         error: 'Missing imageBase64 in request body.',
       });
     }
 
-    // Never hardcode API key. Read securely from serverless environment variables.
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       return res.status(500).json({
-        error:
-          'GEMINI_API_KEY environment variable is not configured. Please set GEMINI_API_KEY in your environment.',
+        success: false,
+        error: 'GEMINI_API_KEY environment variable is not configured on the server.',
       });
     }
 
-    // Strip data URL scheme prefix if included
+    // Clean base64 string
     const cleanBase64 = imageBase64.replace(/^data:[a-zA-Z0-9/+-]+;base64,/, '');
 
-    const prompt = `You are a medical receipt and tax invoice OCR specialist.
-Extract the key healthcare and tax billing details from this receipt image:
+    const prompt = `You are an expert medical receipt and tax invoice OCR specialist.
+Examine this clinic receipt image and extract all clinical and tax details with high precision:
 1. Patient Name: Name of the individual patient receiving treatment or billed.
 2. Clinic Name: Name of the medical clinic, dental clinic, hospital, or specialist center.
 3. After GST Amount: The final total payable amount INCLUDING Goods and Services Tax (GST / VAT).
@@ -77,65 +98,122 @@ Return ONLY a valid JSON object matching this structure without Markdown backtic
   "items": [
     {
       "description": "string",
-      "category": "Consultation | Medication | Procedure | Diagnostic | Consumable | Other",
-      "quantity": number,
-      "unitPrice": number,
-      "amount": number,
-      "isGstApplicable": boolean
+      "category": "Consultation",
+      "quantity": 1,
+      "unitPrice": 0,
+      "amount": 0,
+      "isGstApplicable": true
     }
   ]
 }`;
 
-    // Direct HTTP call to Google Gemini REST endpoint
-    const response = await fetch(GEMINI_API_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'x-goog-api-key': apiKey,
-        'Content-Type': 'application/json',
-        accept: 'application/json',
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              {
-                inline_data: {
-                  mime_type: mimeType,
-                  data: cleanBase64,
-                },
+    const requestBody = {
+      contents: [
+        {
+          parts: [
+            {
+              inline_data: {
+                mime_type: mimeType,
+                data: cleanBase64,
               },
-              {
-                text: prompt,
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.1,
+            },
+            {
+              text: prompt,
+            },
+          ],
         },
-      }),
-    });
+      ],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        temperature: 0.1,
+      },
+    };
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('Gemini REST API error response:', response.status, errorText);
-      return res.status(response.status).json({
-        error: `Gemini API returned status ${response.status}: ${errorText}`,
+    // Helper to call Gemini REST API
+    const callGeminiModel = async (model: string) => {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'x-goog-api-key': apiKey,
+          'Content-Type': 'application/json',
+          accept: 'application/json',
+        },
+        body: JSON.stringify(requestBody),
+        signal: AbortSignal.timeout(15000),
+      });
+
+      const responseText = await resp.text();
+      let parsedJson: GeminiResponse;
+      try {
+        parsedJson = JSON.parse(responseText);
+      } catch {
+        return {
+          status: resp.status,
+          ok: false,
+          data: {
+            error: {
+              code: resp.status,
+              message: responseText.slice(0, 200),
+              status: 'INVALID_RESPONSE',
+            },
+          },
+        };
+      }
+
+      return {
+        status: resp.status,
+        ok: resp.ok,
+        data: parsedJson,
+      };
+    };
+
+    // Attempt 1: Call PRIMARY_MODEL (gemini-3.8-flash)
+    let result: { status: number; ok: boolean; data: GeminiResponse };
+    try {
+      result = await callGeminiModel(PRIMARY_MODEL);
+    } catch (primaryErr) {
+      console.warn(`Primary model ${PRIMARY_MODEL} network or timeout error:`, primaryErr);
+      result = {
+        status: 503,
+        ok: false,
+        data: {
+          error: {
+            code: 503,
+            message: 'Primary model connection timeout or unavailable',
+            status: 'UNAVAILABLE',
+          },
+        },
+      };
+    }
+
+    // If 503 (high demand) or 429, fall back to FALLBACK_MODEL (gemini-3.1-flash-lite)
+    if (!result.ok && (result.status === 503 || result.status === 429 || result.status === 404)) {
+      console.warn(`Primary model returned ${result.status}. Executing fallback with ${FALLBACK_MODEL}...`);
+      try {
+        result = await callGeminiModel(FALLBACK_MODEL);
+      } catch (fallbackErr) {
+        console.error(`Fallback model ${FALLBACK_MODEL} error:`, fallbackErr);
+      }
+    }
+
+    if (!result.ok) {
+      const errorMsg = result.data.error?.message || `API error with status ${result.status}`;
+      return res.status(200).json({
+        success: false,
+        error: errorMsg,
       });
     }
 
-    const data = await response.json();
-
-    // Extract text from Gemini candidates
-    const rawContent = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    const rawContent = result.data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!rawContent) {
-      return res.status(500).json({
-        error: 'No text content returned from Gemini model.',
+      return res.status(200).json({
+        success: false,
+        error: 'No text content returned from Gemini model candidate.',
       });
     }
 
-    // Clean JSON string (remove possible markdown code blocks)
+    // Clean JSON string of any markdown fences
     const cleanedJsonStr = rawContent
       .replace(/^```json\s*/i, '')
       .replace(/^```\s*/i, '')
@@ -151,7 +229,8 @@ Return ONLY a valid JSON object matching this structure without Markdown backtic
   } catch (err: unknown) {
     console.error('Serverless scan-receipt error:', err);
     const message = err instanceof Error ? err.message : 'Unknown error during receipt scan';
-    return res.status(500).json({
+    return res.status(200).json({
+      success: false,
       error: message,
     });
   }

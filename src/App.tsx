@@ -86,15 +86,21 @@ export default function App() {
         }),
       });
 
-      const json = await response.json();
+      const responseText = await response.text();
+      let json: { success?: boolean; data?: ExtractedReceiptData; error?: string } = {};
+      try {
+        json = JSON.parse(responseText);
+      } catch (parseError) {
+        console.warn('Non-JSON response from /api/scan-receipt:', responseText.slice(0, 150), parseError);
+      }
 
-      if (response.ok && json.success && json.data) {
+      if (json && json.success && json.data) {
         extractedData = json.data;
       } else if (presetSample) {
-        // Graceful fallback to rich sample preset data if server response is not returned
+        // Seamless fallback to rich sample preset data
         extractedData = presetSample.presetData;
       } else {
-        throw new Error(json.error || 'Failed to extract text from receipt.');
+        throw new Error(json?.error || 'Failed to extract text from receipt. Please verify image clarity.');
       }
 
       // Ensure mandatory 3 fields are present and sanitized
